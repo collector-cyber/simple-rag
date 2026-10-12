@@ -87,6 +87,75 @@ cd ../backend && python main.py  # FastAPI 自动托管 dist，访问 :8000 即�
 | POST | `/api/chat/stream` | SSE 流式问答 |
 | GET | `/health` | 健康检查 |
 
+## CI/CD 与 AWS 部署
+
+项目内置 GitHub Actions 流水线（`.github/workflows/`），采用业界标准的
+**CI + CD + ECR + ECS Fargate + OIDC** 组合，密钥零落地。
+
+| 文件 | 作用 |
+|---|---|
+| `.github/workflows/ci.yml` | CI：PR / push main 时跑后端语法检查+冒烟测试、前端构建 |
+| `.github/workflows/deploy.yml` | CD：push main 时构建镜像推 ECR，并触发 ECS 滚动更新 |
+| `Dockerfile` | 多阶段构建：Node 打前端 dist → Python 运行时单端口托管 |
+
+架构（A 方案）：
+
+```
+git push main → GitHub Actions ──OIDC换临时凭证──► AWS
+   ├─ 冒烟测试(python -m pytest)
+   ├─ docker build → push Amazon ECR
+   └─ aws ecs update-service --force-new-deployment
+                                     │
+                          ECS Fargate 拉新镜像滚动更新
+                          /data 挂载 EFS（rag.db + uploads 持久化）
+```
+
+### 一、AWS 侧一次性资源
+
+1. **ECR 私有仓库**：命名 `simple-rag`。
+2. **EFS 文件系统**：与安全组同 VPC，创建 `elasticfilesystem:elasticfilesystem:root-access` 之外的挂载点；供 `/data` 持久化。
+3. **IAM Task/Execution Role**：ECS 拉镜像（ECR 读 + EFS 写）所需权限。
+4. **集群 + 服务 + Task Definition（Fargate）**：
+   - 容器镜像填 ECR 仓库的 `:latest`；端口映射 8000；
+   - 环境变量：`OPENAI_API_KEY`（放 Secrets Manager，经 `secrets` 注入）；
+   - 存储：挂载 EFS 到容器 `/data`；
+   - 网络：配 ALB + Security Group，或先临时公网直连验证。
+
+### 二、打通 GitHub ↔ AWS 权限（OIDC，推荐）
+
+> 不用 Access Key，流水线每次跑用一个 15 分钟临时凭证。官方安全做法。
+
+1. IAM → Identity providers → Add → OpenID Connect：
+   - Provider URL：`https://token.actions.githubusercontent.com`
+   - Audience：`sts.amazonaws.com`
+2. 建 IAM Role，信任策略允许你的仓库扮演（关键字段）：
+   ```json
+   {
+     "Effect": "Allow",
+     "Principal": {"AWS": "arn:aws:iam::<账号ID>:oidc-provider/token.actions.githubusercontent.com"},
+     "Action": "sts:AssumeRoleWithWebIdentity",
+     "Condition": {
+       "StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
+       "StringLike": {"token.actions.githubusercontent.com:sub": "repo:<你的GitHub用户名>/simple-rag:*"}
+     }
+   }
+   ```
+3. 给该 Role 挂策略：ECR 推送（`AmazonEC2ContainerRegistryPowerUser`）、
+   ECS 更新（`AmazonECS_FullAccess`）、`iam:PassRole`（传递 Task/Execution Role）。
+4. GitHub 仓库 → Settings → Secrets and variables → Actions → **Variables** 新增：
+   - `AWS_ROLE_ARN` = 上面 Role 的 ARN（ARN 非机密，用 variable 不用 secret）。
+
+### 三、本地先验证镜像
+
+```bash
+docker build -t simple-rag .
+docker run -p 8000:8000 --env-file backend/.env simple-rag
+# 访问 http://127.0.0.1:8000/health
+```
+
+> ⚠️ 提示：uploads 走 EFS 只是「不改代码就能跑起来」的过渡方案。数据量/并发上来后，
+> 建议按业界 B 方案演进：上传文件迁 **S3**、数据库换 **RDS PostgreSQL + pgvector**。
+
 ## 已知边界（有意保持简单）
 
 - 向量全量载入内存检索，适合万级以内 chunk；更大规模应换 pgvector / Faiss。

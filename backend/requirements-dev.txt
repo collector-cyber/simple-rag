@@ -1,0 +1,3 @@
+# ===== 开发/CI 依赖（不含运行时依赖，运行时见 requirements.txt）=====
+# 通过 requirements.txt 已具备 fastapi / httpx，TestClient 可直接使用
+pytest>=8.0

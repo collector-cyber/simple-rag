@@ -1,0 +1,101 @@
+# ============================================================================
+# CD —— 持续部署到 AWS（ECS Fargate + ECR）
+#   触发：push 到 main，或手动 workflow_dispatch
+#   链路：质量门 -> OIDC 换临时凭证 -> 构建并推镜像到 ECR -> ECS 滚动更新
+#   前提（详见 README「部署」章节，均为一次性配置）：
+#     1. AWS 建 GitHub OIDC Identity Provider
+#     2. AWS 建可被本仓库扮演的 IAM Role
+#     3. GitHub 仓库 Settings→Secrets and variables→Actions→Variables 建：
+#          AWS_ROLE_ARN = arn:aws:iam::<账号ID>:role/<流水线角色名>
+#     4. 已有 ECR 仓库、ECS Cluster/Service（Task Definition 引用 :latest 并挂载 EFS）
+# ============================================================================
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# OIDC 需要 id-token 写权限才能向 AWS 换取临时凭证
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: simple-rag      # ECR 仓库名
+  ECS_CLUSTER: simple-rag         # ECS 集群名
+  ECS_SERVICE: simple-rag         # ECS 服务名
+
+jobs:
+  deploy:
+    name: 构建并发布
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # ---------- 质量门：部署前再跑一次冒烟测试，坏了就不 deploy ----------
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 安装依赖并跑冒烟测试
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          python -m pytest -q
+
+      # ---------- 换取 AWS 临时凭证（OIDC，无长期密钥） ----------
+      - name: 配置 AWS 凭证（OIDC）
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 登录 ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---------- 构建镜像并推送到 ECR ----------
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---------- 触发 ECS 用新镜像滚动更新 ----------
+      # Task Definition 引用 :latest，这里强制拉起一次新部署以拉取最新镜像。
+      - name: 通知 ECS 滚动更新
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment
+          echo "已触发滚动更新，等待服务稳定..."
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+          echo "部署完成 ✅"

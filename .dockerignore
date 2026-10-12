@@ -1,0 +1,24 @@
+# 版本控制与流水线（无需进入构建上下文）
+.git
+.github
+
+# Python
+backend/venv/
+backend/.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境变量与本地数据（务必不要打进镜像）
+backend/.env
+backend/data/
+
+# 前端（依赖和产物在镜像内重新构建）
+frontend/node_modules/
+frontend/dist/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+README.md
